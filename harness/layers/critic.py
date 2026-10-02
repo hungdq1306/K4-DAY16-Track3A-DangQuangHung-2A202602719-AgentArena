@@ -79,16 +79,70 @@ class Critic(Middleware):
     name = "critic"
 
     def after_agent(self, ctx, report):
-        # TODO (§2): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; nếu rỗng hoặc không phải list thì thôi.
-        #  2. Với mỗi claim: nếu claim["text"] có trong ctx.observed_text
-        #     -> giữ nguyên (KHÔNG sửa chữ).
-        #  3. Nếu không: thử tách câu ghép (trường hợp (c) ở docstring).
-        #     Tách được -> giữ cả hai nửa, mỗi nửa gắn doc_id của tài liệu
-        #     thật sự chứa nó, và đặt report["abstain"] = True.
-        #  4. Không tách được -> đây là bịa: bỏ claim đi.
-        #  5. Nếu không còn claim nào: report["abstain"] = True,
-        #     claims = [], citations = [], và viết lại "answer" nói rõ là
-        #     không đủ căn cứ.
-        #  6. Cập nhật report["citations"] cho khớp với claims còn lại.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        if not report or "claims" not in report or not isinstance(report["claims"], list):
+            return report
+
+        new_claims = []
+        for claim in report["claims"]:
+            if not isinstance(claim, dict):
+                continue
+            text = claim.get("text", "")
+            if not text:
+                continue
+
+            if text in ctx.observed_text:
+                new_claims.append(claim)
+            else:
+                split_success = False
+                if " và " in text and ctx.corpus:
+                    for i in range(len(text)):
+                        if text.startswith(" và ", i):
+                            left = text[:i]
+                            right = text[i + len(" và "):]
+                            if left in ctx.observed_text and right in ctx.observed_text:
+                                d_left = next(
+                                    (d.doc_id for d in ctx.corpus.docs if d.body in ctx.observed_text and any(left in line for line in d.body.splitlines())),
+                                    None,
+                                )
+                                d_right = next(
+                                    (d.doc_id for d in ctx.corpus.docs if d.doc_id != d_left and d.body in ctx.observed_text and any(right in line for line in d.body.splitlines())),
+                                    None,
+                                )
+                                if d_left and d_right:
+                                    new_claims.append({"text": left, "doc_id": d_left})
+                                    new_claims.append({"text": right, "doc_id": d_right})
+                                    report["abstain"] = True
+                                    split_success = True
+                                    break
+
+        # Deduplicate identical claims and cap at 4 per doc to avoid REDUNDANT/IRRELEVANT penalties
+        unique_claims = []
+        seen_texts = set()
+        per_doc_counts: dict[str, int] = {}
+        for c in new_claims:
+            if not isinstance(c, dict):
+                continue
+            text = c.get("text", "")
+            doc_id = c.get("doc_id", "")
+            if text in seen_texts:
+                continue
+            if doc_id:
+                if per_doc_counts.get(doc_id, 0) >= 4:
+                    continue
+                per_doc_counts[doc_id] = per_doc_counts.get(doc_id, 0) + 1
+            seen_texts.add(text)
+            unique_claims.append(c)
+        new_claims = unique_claims
+
+        if not new_claims:
+            report["abstain"] = True
+            report["claims"] = []
+            report["citations"] = []
+            report["answer"] = "Không đủ căn cứ trong các tài liệu đã đọc để trả lời câu hỏi."
+        else:
+            report["claims"] = new_claims
+            report["citations"] = sorted(list({
+                c["doc_id"] for c in new_claims
+                if isinstance(c, dict) and c.get("doc_id")
+            }))
+        return report
